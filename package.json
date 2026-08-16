@@ -1,0 +1,40 @@
+{
+  "name": "jingshibang-crawler",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "菁师帮题目采集、视觉转录、去重与 Markdown 导出工具",
+  "scripts": {
+    "auth": "tsx src/cli.ts auth",
+    "crawl": "tsx src/cli.ts crawl",
+    "download": "tsx src/cli.ts download",
+    "review": "tsx src/cli.ts review",
+    "export": "tsx src/cli.ts export",
+    "export:topic": "tsx src/cli.ts export-topic",
+    "db:init": "tsx src/cli.ts db-init",
+    "vision:probe": "tsx scripts/vision-probe.ts",
+    "report": "tsx scripts/crawl-report.ts",
+    "assets:refine": "tsx src/cli.ts refine-assets",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "better-sqlite3": "^12.2.0",
+    "commander": "^14.0.1",
+    "dotenv": "^17.2.1",
+    "playwright": "^1.54.2",
+    "sharp": "^0.35.3",
+    "zod": "^4.0.17"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/node": "^24.2.1",
+    "tsx": "^4.20.3",
+    "typescript": "^5.9.2",
+    "vitest": "^3.2.4"
+  }
+}

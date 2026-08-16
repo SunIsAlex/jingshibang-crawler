@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="800" height="1200">
+  <rect width="800" height="1200" fill="white"/>
+  <text x="40" y="100" font-size="38" fill="black">1. 已知 f(x)=log₂x，选择正确选项</text>
+  <text x="70" y="170" font-size="32" fill="black">A. (0,+∞)  B. (-∞,0)</text>
+  <text x="40" y="650" font-size="38" fill="black">2. 计算 √(x+1) 的定义域</text>
+  <text x="70" y="720" font-size="32" fill="black">请写出结果。</text>
+</svg>

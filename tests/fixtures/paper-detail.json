@@ -1,0 +1,19 @@
+{
+  "status": 200,
+  "msg": "ok",
+  "data": {
+    "storeInfo": {
+      "id": 123456,
+      "store_name": "2025北京某区高一（上）期中数学",
+      "store_grade": "高一",
+      "store_subject": "数学",
+      "district": "某区",
+      "store_type": "(上)期中",
+      "pdf_paper": "/fixtures/paper.pdf",
+      "pdf_answer": "",
+      "word_paper": "",
+      "word_answer": "",
+      "have_answer": ""
+    }
+  }
+}
