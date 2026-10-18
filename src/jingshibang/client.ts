@@ -19,6 +19,8 @@ export interface SearchOptions {
   year?: number;
   region?: string;
   grade?: string;
+  /** Subject from the "学段学科" menu, e.g. 数学. The stage (高中/初中/小学) follows from grade. */
+  subject?: string;
   page?: number;
 }
 
@@ -64,6 +66,12 @@ export class JingshibangClient {
     } else {
       this.guard.assertAllowedRequest(routes.home, "page");
       response = await this.performAndWait("/api/products", () => this.page.goto(routes.home, { waitUntil: "domcontentloaded" }));
+      if (options.subject) {
+        const stage = /^初/.test(options.grade ?? "") ? "初中" : /^高/.test(options.grade ?? "") || !options.grade ? "高中" : "小学";
+        await this.page.getByText("学段学科").first().click();
+        const menu = this.page.getByText(stage, { exact: true }).first().locator("xpath=..");
+        response = await this.performAndWait("/api/products", () => menu.getByText(options.subject!, { exact: true }).first().click());
+      }
       for (const label of [options.grade, options.year?.toString(), options.region].filter(Boolean) as string[]) {
         response = await this.performAndWait("/api/products", () => this.page.getByText(label, { exact: true }).first().click());
       }

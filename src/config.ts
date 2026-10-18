@@ -27,6 +27,7 @@ const envSchema = z.object({
   REQUEST_RETRIES: z.coerce.number().int().min(0).max(5).default(2),
   HEADLESS: booleanString,
   BROWSER_CHANNEL: z.string().default("chrome"),
+  BROWSER_EXECUTABLE_PATH: z.string().default(""),
   BROWSER_TIMEOUT_MS: z.coerce.number().int().min(5_000).default(60_000),
   AUTH_STATE_PATH: z.string().default(".local/auth-state.json"),
   DATABASE_PATH: z.string().default("data/jingshibang.db"),

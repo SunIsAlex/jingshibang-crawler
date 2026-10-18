@@ -41,6 +41,14 @@ npm run auth
 
 登录完成后回到终端按 Enter，授权状态只保存在 `.local/auth-state.json`。
 
+没有显示器的环境（服务器、手机 chroot）可用无头浏览器扫码登录：二维码保存为 PNG，用已关注"北京题库"的微信扫码（可"从相册选取"），扫码成功后自动保存授权状态；二维码轮换时会自动覆盖该文件。
+
+```bash
+npm run auth -- --qr-file login-qr.png
+```
+
+如果没有安装 Playwright 自带的浏览器，可在 `.env` 中设置 `BROWSER_EXECUTABLE_PATH=/usr/bin/chromium`。
+
 ## CLI
 
 ```bash
@@ -54,6 +62,7 @@ npm run crawl -- --paper 192455 --refresh
 
 npm run pdf -- --paper 192455
 npm run pdf -- --keyword "对数函数" --page 2
+npm run pdf -- --subject 数学 --grade 高三 --year 2026
 
 npm run review
 npm run assets:refine -- --paper 192455

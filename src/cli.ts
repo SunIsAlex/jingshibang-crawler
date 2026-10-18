@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { Command } from "commander";
-import { interactiveLogin } from "./browser/session.js";
+import { interactiveLogin, qrCodeLogin } from "./browser/session.js";
 import { Crawler, type CrawlOptions } from "./crawler/crawler.js";
 import { fetchOriginalPdfs, type FetchPdfOptions } from "./crawler/pdf-fetcher.js";
 import { DownloadQuotaGuard } from "./crawler/quota.js";
@@ -16,12 +16,14 @@ import { OpenAICompatibleVisionProvider } from "./vision/openai.js";
 const program = new Command();
 program.name("jingshibang").description("菁师帮题目采集器（正常预览、默认零下载）");
 
-program.command("auth").description("由用户亲自登录并保存本地授权状态").action(interactiveLogin);
+program.command("auth").description("由用户亲自登录并保存本地授权状态")
+  .option("--qr-file <path>", "无显示器环境：把微信登录二维码保存为 PNG，由用户扫码")
+  .action(async ({ qrFile }: { qrFile?: string }) => qrFile ? qrCodeLogin(qrFile) : interactiveLogin());
 
 program.command("crawl")
   .description("搜索/打开正常详情、读取正常预览、识别并缓存题目")
   .option("--keyword <keyword>").option("--year <year>", "年份", Number)
-  .option("--region <region>").option("--grade <grade>").option("--paper <paperId>")
+  .option("--region <region>").option("--grade <grade>").option("--subject <subject>", "学科，如 数学").option("--paper <paperId>")
   .option("--page <page>", "列表页", Number).option("--resume").option("--dry-run")
   .option("--refresh", "重新处理已存在且内容未变化的试卷")
   .action(async (options: CrawlOptions) => new Crawler().run(options));
@@ -29,7 +31,8 @@ program.command("crawl")
 program.command("pdf")
   .description("保存正常预览已加载的试卷原始 PDF（不调用 AI、不发额外请求、不消耗下载额度）")
   .option("--paper <paperId>").option("--keyword <keyword>").option("--year <year>", "年份", Number)
-  .option("--region <region>").option("--grade <grade>").option("--page <page>", "列表页", Number)
+  .option("--region <region>").option("--grade <grade>").option("--subject <subject>", "学科，如 数学")
+  .option("--page <page>", "列表页", Number)
   .action(async (options: FetchPdfOptions) => fetchOriginalPdfs(options));
 
 program.command("download").description("显式资料下载模块（默认和未验证 endpoint 均 fail-closed）")
