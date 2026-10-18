@@ -29,16 +29,19 @@ export class PageSegmenter {
       for (let x = 0; x < info.width; x += 1) if (data[y * info.width + x]! < darkThreshold) dark += 1;
       occupied[y] = dark / info.width >= minimumDarkRatio;
     }
-    const bands = this.findBands(occupied, 18).filter((band) => band.bottom - band.top >= 8);
+    // Thresholds were tuned on 1718px-high preview canvases; scale them for higher-resolution PDF renders.
+    const scale = Math.max(1, info.height / 1718);
+    const bands = this.findBands(occupied, Math.round(18 * scale)).filter((band) => band.bottom - band.top >= 8 * scale);
     // Keep dense exam pages to roughly 1-3 questions per vision request.
-    const crops = this.groupBands(bands, info.height, 520, 140);
+    const crops = this.groupBands(bands, info.height, Math.round(520 * scale), Math.round(140 * scale));
     const outputDir = path.join(this.outputRoot, paperId);
     await ensureDir(outputDir);
     const result: QuestionCrop[] = [];
     for (let index = 0; index < crops.length; index += 1) {
       const crop = crops[index]!;
-      const top = Math.max(0, crop.top - 24);
-      const height = Math.min(info.height - top, crop.bottom - top + 24);
+      const padding = Math.round(24 * scale);
+      const top = Math.max(0, crop.top - padding);
+      const height = Math.min(info.height - top, crop.bottom - top + padding);
       const outputPath = path.join(outputDir, `${paperId}-p${String(pageNo).padStart(3, "0")}-c${String(index + 1).padStart(2, "0")}.png`);
       await sharp(pagePath).extract({ left: 0, top, width: info.width, height }).png().toFile(outputPath);
       result.push({ path: outputPath, page: pageNo, index: index + 1, top, height, width: info.width });

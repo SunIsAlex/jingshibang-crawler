@@ -2,6 +2,7 @@
 import { Command } from "commander";
 import { interactiveLogin } from "./browser/session.js";
 import { Crawler, type CrawlOptions } from "./crawler/crawler.js";
+import { fetchOriginalPdfs, type FetchPdfOptions } from "./crawler/pdf-fetcher.js";
 import { DownloadQuotaGuard } from "./crawler/quota.js";
 import { AppDatabase } from "./database/database.js";
 import { Repository } from "./database/repository.js";
@@ -24,6 +25,12 @@ program.command("crawl")
   .option("--page <page>", "列表页", Number).option("--resume").option("--dry-run")
   .option("--refresh", "重新处理已存在且内容未变化的试卷")
   .action(async (options: CrawlOptions) => new Crawler().run(options));
+
+program.command("pdf")
+  .description("保存正常预览已加载的试卷原始 PDF（不调用 AI、不发额外请求、不消耗下载额度）")
+  .option("--paper <paperId>").option("--keyword <keyword>").option("--year <year>", "年份", Number)
+  .option("--region <region>").option("--grade <grade>").option("--page <page>", "列表页", Number)
+  .action(async (options: FetchPdfOptions) => fetchOriginalPdfs(options));
 
 program.command("download").description("显式资料下载模块（默认和未验证 endpoint 均 fail-closed）")
   .requiredOption("--resource <resourceId>").action(async ({ resource }) => {

@@ -39,3 +39,9 @@ questions 中每道题保留 number、type、stem_markdown、options、images、
 只输出严格 JSON，不要解释或输出思考过程。`;
 
 export const FORMULA_VERIFY_PROMPT = `只核对图片中的局部数学公式并精确转录为 LaTeX。LaTeX 数学环境内不要在等号两侧添加空格，例如写 $\\omega=$，不要写 $\\omega = $。不要解题、推导或补全上下文。无法确认的字符写 [UNCERTAIN: ...]。输出严格 JSON：{"formula":"...","confidence":0.0,"uncertain_regions":[]}。`;
+
+export const PDF_TEXT_HINT_PROMPT = `下面附有原始 PDF 内嵌文字层中与图片区域对应的文字。它直接取自 PDF，不是 OCR，按版面行排列。
+使用规则：
+1. 汉字、标点、题号、选项字母和普通数字以文字层为准，避免误识别。
+2. 公式、上下标、分式、根号、向量和几何图标注等版面结构以图片为准，并按要求转为 LaTeX。文字层里公式字符的顺序可能错乱，不要照抄。
+3. 文字层与图片不一致、缺字或乱码时以图片为准；不要输出图片中不存在的内容。`;

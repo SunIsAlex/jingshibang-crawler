@@ -21,6 +21,12 @@ export class AppDatabase {
     const schema = fs.readFileSync(path.join(currentDir, "schema.sql"), "utf8");
     this.db.exec(schema);
     this.migrateLegacyImageUniqueness();
+    this.ensureColumn("questions", "extraction_method", "TEXT");
+  }
+
+  private ensureColumn(table: string, column: string, definition: string): void {
+    const columns = this.db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
+    if (!columns.some((item) => item.name === column)) this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
   }
 
   private migrateLegacyImageUniqueness(): void {

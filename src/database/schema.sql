@@ -31,6 +31,7 @@ CREATE TABLE IF NOT EXISTS questions (
   vision_confidence REAL,
   review_status TEXT NOT NULL DEFAULT 'needs_review',
   question_crop_path TEXT,
+  extraction_method TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
@@ -84,6 +85,20 @@ CREATE TABLE IF NOT EXISTS paper_pages (
   width INTEGER NOT NULL,
   height INTEGER NOT NULL,
   UNIQUE(paper_id, page_no)
+);
+
+CREATE TABLE IF NOT EXISTS paper_documents (
+  id INTEGER PRIMARY KEY,
+  paper_id INTEGER NOT NULL REFERENCES papers(id) ON DELETE CASCADE,
+  kind TEXT NOT NULL,
+  source_url_redacted TEXT,
+  local_path TEXT NOT NULL,
+  sha256 TEXT NOT NULL,
+  byte_size INTEGER NOT NULL,
+  page_count INTEGER NOT NULL,
+  text_layer_pages INTEGER NOT NULL,
+  captured_at TEXT NOT NULL,
+  UNIQUE(paper_id, kind)
 );
 
 CREATE TABLE IF NOT EXISTS vision_cache (

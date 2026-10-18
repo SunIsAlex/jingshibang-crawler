@@ -7,6 +7,8 @@ export interface VisionExtractOptions {
   mode?: "extract" | "verify" | "formula";
   firstResult?: ExtractedQuestion[];
   mimeTypes?: string[];
+  /** Embedded PDF text for the same region (not OCR). Used as a character-level reference. */
+  textHint?: string;
 }
 
 export interface FigureLocation {

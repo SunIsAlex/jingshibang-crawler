@@ -1,20 +1,26 @@
 import fs from "node:fs/promises";
 import path from "node:path";
+import sharp from "sharp";
 import { config } from "../config.js";
 import { createBrowserSession } from "../browser/session.js";
 import { NetworkObserver } from "../browser/network-observer.js";
 import { AppDatabase } from "../database/database.js";
 import { Repository } from "../database/repository.js";
-import { JingshibangClient, type SearchOptions } from "../jingshibang/client.js";
+import { JingshibangClient, type CapturedPage, type SearchOptions } from "../jingshibang/client.js";
 import { routes } from "../jingshibang/routes.js";
 import { RequestSafetyGuard } from "../jingshibang/security.js";
 import type { ExtractedQuestion, PaperListItem } from "../parsing/schemas.js";
+import { analyzeRegion, type GreyRaster } from "../pdf/region-raster.js";
+import {
+  isTextOnlyEligible, linesInBand, parseTextQuestion, planQuestionRegions, regionText, type QuestionRegion, type RegionPlan,
+} from "../pdf/text-layout.js";
 import { atomicWrite, ensureDir, pathExists } from "../utils/files.js";
 import { sha256 } from "../utils/hash.js";
 import { logger } from "../utils/logger.js";
 import { normalizeQuestionText } from "../utils/normalize.js";
 import { VisionCache } from "../vision/cache.js";
 import { VisionExtractor, type ScoredQuestion } from "../vision/extractor.js";
+import type { PixelBox } from "../vision/figure-asset-refiner.js";
 import { FormulaVisionVerifier } from "../vision/formula-verifier.js";
 import { OpenAICompatibleVisionProvider } from "../vision/openai.js";
 import { PageSegmenter } from "../vision/page-segmenter.js";
@@ -29,7 +35,20 @@ export interface CrawlOptions extends SearchOptions {
 }
 
 interface FormulaReviewResult { cropPath: string; formula: string; confidence: number; issues: string[] }
-interface PendingSave { scored: ScoredQuestion; sourcePages: number[]; cropPath: string; formulaReview: FormulaReviewResult | undefined }
+/** pdf_text: parsed from the PDF text layer without AI; vision+pdf_text: vision with the PDF text as a hint. */
+type ExtractionMethod = "pdf_text" | "vision+pdf_text" | "vision";
+interface FigureRef { pagePath: string; box: PixelBox }
+interface PageItem {
+  buffer: Buffer; cropPath: string; textHint?: string; textQuestion?: ExtractedQuestion;
+  figures: FigureRef[]; method: ExtractionMethod;
+  /** Crop is exactly one question region from the PDF text plan, so crop-boundary repairs are unnecessary. */
+  planned: boolean;
+}
+interface PageExtraction extends PageItem { scored: ScoredQuestion[] }
+interface PendingSave {
+  scored: ScoredQuestion; sourcePages: number[]; cropPath: string; formulaReview: FormulaReviewResult | undefined;
+  method: ExtractionMethod; planned: boolean; figures: FigureRef[];
+}
 
 export function looksLikeAnswerMaterial(items: ScoredQuestion[]): boolean {
   if (items.length === 0) return false;
@@ -92,7 +111,7 @@ export class Crawler {
     let interrupted = false; const onInterrupt = () => { interrupted = true; logger.warn("CHECKPOINT", { reason: "SIGINT" }); };
     process.once("SIGINT", onInterrupt);
     const summary = { scannedPapers: 0, newPapers: 0, existingPapers: 0, scannedQuestions: 0,
-      newQuestions: 0, duplicates: 0, updated: 0, pageCacheHits: 0 };
+      newQuestions: 0, duplicates: 0, updated: 0, pageCacheHits: 0, pdfPapers: 0, textOnlyQuestions: 0 };
     try {
       browser = await createBrowserSession();
       observer.attach(browser.page);
@@ -113,12 +132,19 @@ export class Crawler {
         const opened = await client.openPaper(paper.id, paper.store_name, Boolean(options.paper));
         const detail = opened.detail;
         const contentHash = sha256(JSON.stringify({ title: detail.store_name, date: detail.add_time,
-          pdf: Boolean(detail.pdf_paper), answer: Boolean(detail.pdf_answer), pages: opened.pages.map((page) => page.sha256) }));
+          pdf: Boolean(detail.pdf_paper), answer: Boolean(detail.pdf_answer), pages: opened.pages.map((page) => page.sha256),
+          ...(opened.pdf ? { sourcePdf: opened.pdf.sha256 } : {}) }));
         const paperRecord = repository.upsertPaper({ remoteId: paper.id, title: detail.store_name, year: this.parseYear(detail.store_name),
           region: detail.district || null, grade: detail.store_grade || null, subject: detail.store_subject || null,
           examType: detail.store_type || null, sourceUrl: routes.paperDetail(paper.id, detail.store_name), contentHash });
         if (paperRecord.created) summary.newPapers += 1;
         else summary.existingPapers += 1;
+        if (opened.pdf) {
+          summary.pdfPapers += 1;
+          repository.savePaperDocument({ paperId: paperRecord.id, kind: "preview_pdf", sourceUrl: opened.pdf.sourceUrl,
+            localPath: opened.pdf.localPath, sha256: opened.pdf.sha256, byteSize: opened.pdf.byteSize,
+            pageCount: opened.pdf.pageCount, textLayerPages: opened.pdf.textLayerPages });
+        }
         for (const page of opened.pages) {
           repository.savePaperPage({ paperId: paperRecord.id, pageNo: page.pageNo, localPath: page.localPath,
             sha256: page.sha256, width: page.width, height: page.height });
@@ -133,15 +159,17 @@ export class Crawler {
           continue;
         }
         const pending: PendingSave[] = [];
+        const plan = this.planFromTextLayer(opened.pages, paper.id);
         for (const page of opened.pages) {
           if (interrupted) break;
-          const crops = await segmenter.segment(page.localPath, paper.id, page.pageNo);
-          const pageExtractions: Array<{ scored: ScoredQuestion[]; buffer: Buffer; cropPath: string }> = [];
+          if (plan?.answerBoundary && page.pageNo > plan.answerBoundary.pageNo) break;
+          const items = await this.preparePageItems(page, paper.id, plan, segmenter);
+          const pageExtractions: PageExtraction[] = [];
           let answerPageDetected = false;
-          for (const crop of crops) {
-            const buffer = await fs.readFile(crop.path);
-            const scored = await vision.extract([buffer], paper.id, page.pageNo);
-            pageExtractions.push({ scored, buffer, cropPath: crop.path });
+          for (const item of items) {
+            const scored = item.textQuestion ? [vision.score(item.textQuestion)]
+              : await vision.extract([item.buffer], paper.id, page.pageNo, item.textHint);
+            pageExtractions.push({ ...item, scored });
             if (looksLikeAnswerMaterial(scored)) { answerPageDetected = true; break; }
           }
           const pageQuestions = pageExtractions.flatMap((item) => item.scored);
@@ -153,8 +181,9 @@ export class Crawler {
           await this.repairIncompleteCrossPageChoice(pending, pageExtractions, vision, paper.id, page.pageNo);
           for (const extraction of pageExtractions) {
             let scored: ScoredQuestion[];
-            try {
-              scored = await vision.verifyLowConfidence([extraction.buffer], paper.id, page.pageNo, extraction.scored);
+            if (extraction.method === "pdf_text") scored = extraction.scored;
+            else try {
+              scored = await vision.verifyLowConfidence([extraction.buffer], paper.id, page.pageNo, extraction.scored, extraction.textHint);
             } catch {
               logger.warn("VISION", { page: page.pageNo, verify: "failed-at-orchestrator", action: "retain-first-result-needs-review" });
               scored = extraction.scored.map((item) => ({
@@ -178,25 +207,29 @@ export class Crawler {
                   logger.warn("FORMULA", { q: item.question.number, localReview: "failed", action: "needs-review" });
                 }
               }
-              this.appendPending(pending, item, page.pageNo, extraction.cropPath, formulaReview);
+              this.appendPending(pending, item, page.pageNo, extraction, formulaReview);
             }
           }
           checkpoint.save("crawl", {
             ...(options.keyword ? { keyword: options.keyword } : {}), page: options.page ?? 1, paperId: paper.id, previewPage: page.pageNo,
           });
+          if (plan?.answerBoundary?.pageNo === page.pageNo) {
+            logger.info("PREVIEW", { paper: paper.id, answerSectionAtPage: page.pageNo, reason: plan.answerBoundary.reason, action: "stop-after-question-regions" });
+            break;
+          }
         }
         if (interrupted) break;
         if (pending.length === 0) throw new Error(`No question pages were identified for paper ${paper.id}`);
         assertCompleteNumericSequence(pending);
         assertChoiceOptionsComplete(pending);
-        const prepared: Array<{ item: PendingSave; asset: { localPath: string; sha256: string } | null }> = [];
-        for (const item of pending) prepared.push({ item, asset: await this.materializeQuestionAsset(item.scored.question, item.cropPath) });
+        const prepared: Array<{ item: PendingSave; assets: Array<{ localPath: string; sha256: string }> }> = [];
+        for (const item of pending) prepared.push({ item, assets: await this.materializeQuestionAssets(item.scored.question, item.cropPath, item.figures) });
         const savedResults = database.db.transaction(() => {
           if (!paperRecord.created) repository.replacePaperSources(paperRecord.id);
-          return prepared.map(({ item, asset }) => {
+          return prepared.map(({ item, assets }) => {
             const saved = repository.saveQuestion(paperRecord.id, item.scored.question, item.sourcePages, item.cropPath,
-              item.scored.finalConfidence, asset ? [asset.sha256] : []);
-            if (asset) repository.saveAsset({ questionId: saved.id, localPath: asset.localPath, sha256: asset.sha256, mimeType: "image/png" });
+              item.scored.finalConfidence, assets.map((asset) => asset.sha256), item.method);
+            for (const asset of assets) repository.saveAsset({ questionId: saved.id, localPath: asset.localPath, sha256: asset.sha256, mimeType: "image/png" });
             if (item.formulaReview) repository.saveFormulaReview({ questionId: saved.id, cropPath: item.formulaReview.cropPath,
               formulaMarkdown: item.formulaReview.formula, confidence: item.formulaReview.confidence, issues: item.formulaReview.issues });
             return { item, saved };
@@ -205,7 +238,8 @@ export class Crawler {
         for (const { item, saved } of savedResults) {
           summary.scannedQuestions += 1;
           if (saved.duplicate) summary.duplicates += 1; else summary.newQuestions += 1;
-          logger.info("QUESTION", { number: item.scored.question.number, duplicate: saved.duplicate, hash: saved.contentHash.slice(0, 12) });
+          if (item.method === "pdf_text") summary.textOnlyQuestions += 1;
+          logger.info("QUESTION", { number: item.scored.question.number, method: item.method, duplicate: saved.duplicate, hash: saved.contentHash.slice(0, 12) });
         }
       }
       if (!interrupted) checkpoint.clear("crawl");
@@ -232,7 +266,7 @@ export class Crawler {
     }
   }
 
-  private appendPending(pending: PendingSave[], scored: ScoredQuestion, page: number, cropPath: string,
+  private appendPending(pending: PendingSave[], scored: ScoredQuestion, page: number, source: PageItem,
     formulaReview?: FormulaReviewResult): void {
     const previous = pending.at(-1);
     const question = scored.question;
@@ -260,12 +294,18 @@ export class Crawler {
       previous.scored.finalConfidence = Math.min(previous.scored.finalConfidence, scored.finalConfidence);
       if (!previous.sourcePages.includes(page)) previous.sourcePages.push(page);
       previous.formulaReview ??= formulaReview;
-    } else pending.push({ scored: { ...scored, question: structuredClone(question) }, sourcePages: [page], cropPath, formulaReview });
+      if (previous.method !== source.method) previous.method = "vision+pdf_text";
+      previous.planned &&= source.planned;
+      previous.figures.push(...source.figures);
+    } else {
+      pending.push({ scored: { ...scored, question: structuredClone(question) }, sourcePages: [page], cropPath: source.cropPath,
+        formulaReview, method: source.method, planned: source.planned, figures: [...source.figures] });
+    }
   }
 
   private async repairIncompleteCrossPageChoice(
     pending: PendingSave[],
-    pageExtractions: Array<{ scored: ScoredQuestion[]; buffer: Buffer; cropPath: string }>,
+    pageExtractions: PageExtraction[],
     vision: VisionExtractor,
     paperId: string,
     page: number,
@@ -274,6 +314,8 @@ export class Crawler {
     if (!previous || !first || previous.sourcePages.at(-1) === page) return;
     const question = previous.scored.question;
     if (!["single_choice", "multiple_choice"].includes(question.type)) return;
+    // Text-planned regions already carry cross-page continuations explicitly.
+    if (previous.planned && first.planned && question.options.length >= 2) return;
     const firstNumber = first.scored.map((item) => item.question.number).find((value) => /^\d+$/.test(value));
     const consecutiveBoundary = firstNumber !== undefined && Number(firstNumber) === Number(question.number) + 1;
     if (question.options.length >= 2 && !consecutiveBoundary) return;
@@ -291,13 +333,14 @@ export class Crawler {
   }
 
   private async repairAdjacentChoiceBoundaries(
-    extractions: Array<{ scored: ScoredQuestion[]; buffer: Buffer; cropPath: string }>,
+    extractions: PageExtraction[],
     vision: VisionExtractor,
     paperId: string,
     page: number,
   ): Promise<void> {
     for (let index = 0; index < extractions.length - 1; index += 1) {
       const current = extractions[index]!; const next = extractions[index + 1]!;
+      if (current.planned && next.planned) continue;
       const candidate = current.scored.at(-1);
       if (!candidate || !["single_choice", "multiple_choice"].includes(candidate.question.type)) continue;
       if (candidate.question.options.length >= 2 && !candidate.question.continues_on_next_page) continue;
@@ -310,14 +353,75 @@ export class Crawler {
     }
   }
 
-  private async materializeQuestionAsset(question: ExtractedQuestion, cropPath: string): Promise<{ localPath: string; sha256: string } | null> {
-    if (question.images.length === 0) return null;
-    const buffer = await fs.readFile(cropPath); const imageHash = sha256(buffer);
+  private async materializeQuestionAssets(question: ExtractedQuestion, cropPath: string, figures: FigureRef[]): Promise<Array<{ localPath: string; sha256: string }>> {
+    if (question.images.length === 0) return [];
+    // Prefer exact figure boxes found by masking PDF text; otherwise keep the whole question crop as before.
+    const buffers = figures.length
+      ? await Promise.all(figures.map(({ pagePath, box }) => sharp(pagePath)
+        .extract({ left: box.left, top: box.top, width: box.right - box.left, height: box.bottom - box.top }).png().toBuffer()))
+      : [await fs.readFile(cropPath)];
     await ensureDir(config.assetsDir);
-    const localPath = path.join(config.assetsDir, `${imageHash}.png`);
-    if (!await pathExists(localPath)) await fs.copyFile(cropPath, localPath);
-    for (const image of question.images) image.path = localPath;
-    return { localPath, sha256: imageHash };
+    const assets: Array<{ localPath: string; sha256: string }> = [];
+    for (const buffer of buffers) {
+      const imageHash = sha256(buffer);
+      const localPath = path.join(config.assetsDir, `${imageHash}.png`);
+      if (!await pathExists(localPath)) await fs.writeFile(localPath, buffer);
+      if (!assets.some((asset) => asset.sha256 === imageHash)) assets.push({ localPath, sha256: imageHash });
+    }
+    question.images.forEach((image, index) => { image.path = assets[Math.min(index, assets.length - 1)]!.localPath; });
+    return assets;
+  }
+
+  private planFromTextLayer(pages: CapturedPage[], paperId: string): RegionPlan | null {
+    if (config.PDF_TEXT_MODE === "off") return null;
+    const texts = pages.flatMap((page) => page.text ? [page.text] : []);
+    if (texts.length === 0) return null;
+    const plan = planQuestionRegions(texts);
+    logger.info("PDF_TEXT", { paper: paperId, textPages: plan.plannedPages.size, regions: plan.regions.length,
+      answerBoundaryPage: plan.answerBoundary?.pageNo ?? null });
+    return plan.regions.length > 0 ? plan : null;
+  }
+
+  private async preparePageItems(page: CapturedPage, paperId: string, plan: RegionPlan | null, segmenter: PageSegmenter): Promise<PageItem[]> {
+    const text = config.PDF_TEXT_MODE !== "off" && page.text?.reliable ? page.text : undefined;
+    if (!plan || !text || !plan.plannedPages.has(page.pageNo)) {
+      // No usable text plan for this page: segment the image; still pass any reliable PDF text as a hint.
+      const crops = await segmenter.segment(page.localPath, paperId, page.pageNo);
+      return Promise.all(crops.map(async (crop): Promise<PageItem> => {
+        const hint = text ? linesInBand(text.lines, crop.top, crop.top + crop.height).map((line) => line.text).join("\n") : "";
+        return { buffer: await fs.readFile(crop.path), cropPath: crop.path, figures: [], planned: false,
+          ...(hint ? { textHint: hint, method: "vision+pdf_text" as const } : { method: "vision" as const }) };
+      }));
+    }
+    const { data, info } = await sharp(page.localPath).flatten({ background: "white" }).greyscale().raw().toBuffer({ resolveWithObject: true });
+    const raster: GreyRaster = { data, width: info.width, height: info.height };
+    const directory = path.join(config.questionCropsDir, paperId); await ensureDir(directory);
+    const items: PageItem[] = [];
+    for (const region of plan.regions.filter((candidate) => candidate.pageNo === page.pageNo)) {
+      const analysis = analyzeRegion(raster, region, region.lines.flatMap((line) => line.items));
+      if (analysis.empty) continue;
+      const padding = Math.round(12 * config.PDF_RENDER_SCALE / 2);
+      const top = Math.max(0, analysis.top - padding); const bottom = Math.min(info.height, analysis.bottom + padding);
+      const cropPath = path.join(directory, `${paperId}-p${String(page.pageNo).padStart(3, "0")}-q${region.questionNo.padStart(2, "0")}${region.continuesFromPreviousPage ? "-cont" : ""}.png`);
+      await sharp(page.localPath).extract({ left: 0, top, width: info.width, height: bottom - top }).png().toFile(cropPath);
+      const buffer = await fs.readFile(cropPath);
+      const figures = analysis.figures.map((box) => ({ pagePath: page.localPath, box }));
+      const question = parseTextQuestion(region);
+      if (config.PDF_TEXT_MODE === "auto" && isTextOnlyEligible(region, analysis.residualInkRatio, question)) {
+        logger.info("PDF_TEXT", { page: page.pageNo, q: region.questionNo, textOnly: true });
+        items.push({ buffer, cropPath, textQuestion: question!, figures, method: "pdf_text", planned: true });
+      } else {
+        items.push({ buffer, cropPath, textHint: this.regionHint(region), figures, method: "vision+pdf_text", planned: true });
+      }
+    }
+    return items;
+  }
+
+  private regionHint(region: QuestionRegion): string {
+    const note = region.continuesFromPreviousPage
+      ? `（本图片区域是第 ${region.questionNo} 题跨页后的续接部分：number 填 "${region.questionNo}"，continues_from_previous_page=true。）\n`
+      : "";
+    return `${note}${regionText(region)}`;
   }
 
   private parseYear(title: string): number | null { const match = title.match(/(?:19|20)\d{2}/); return match ? Number(match[0]) : null; }
@@ -326,7 +430,9 @@ export class Crawler {
     console.log("========== Dry Run ==========");
     console.log(`页面计划：${options.paper ? `正常详情 paperId=${options.paper}` : options.keyword ? `正常搜索 keyword=${options.keyword}` : "正常试卷列表"}`);
     console.log(`预计列表请求：${options.paper ? 0 : 1}`); console.log(`预计每张试卷详情/预览：2 个核心请求（详情 + 预览）`);
-    console.log("AI：仅对未命中 vision_cache 的 crop 调用；受运行预算限制");
+    console.log(`试卷原件：${config.PREVIEW_SOURCE === "canvas" ? "不保存（PREVIEW_SOURCE=canvas）" : "被动保存预览页面已加载的原始 PDF，不发额外请求"}`);
+    console.log(`PDF 文字层：${config.PDF_TEXT_MODE === "off" ? "不使用" : config.PDF_TEXT_MODE === "hint" ? "作为 AI 转录参考" : "纯文字题直接解析，其余作为 AI 转录参考"}`);
+    console.log("AI：仅对无法由 PDF 文字层忠实还原、且未命中 vision_cache 的 crop 调用；受运行预算限制");
     console.log("资料下载：否"); console.log("资料下载额度消耗：0");
   }
 
@@ -336,6 +442,7 @@ export class Crawler {
     console.log("========== Crawl Summary =========="); console.log(`网络请求：${network.requests ?? 0}`);
     console.log(`发现试卷：${summary.scannedPapers}  新增试卷：${summary.newPapers}`);
     console.log(`发现题目：${summary.scannedQuestions}  新增题目：${summary.newQuestions}  重复题目：${summary.duplicates}`);
+    console.log(`原始 PDF：${summary.pdfPapers}  PDF 文字层直出题目（未调用 AI）：${summary.textOnlyQuestions}`);
     console.log(`AI 请求：${vision.requests}  缓存命中：${vision.cacheHits}  二次验证：${vision.verifications}  公式局部复核：${vision.formulaReviews ?? 0}`);
     console.log("资料下载额度消耗：0"); console.log(`STATUS: ${status}`);
   }

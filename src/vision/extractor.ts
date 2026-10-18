@@ -23,25 +23,28 @@ export class VisionExtractor {
     private readonly budget: VisionBudgetGuard,
   ) {}
 
-  async extract(images: Buffer[], paperId: string, page: number): Promise<ScoredQuestion[]> {
+  async extract(images: Buffer[], paperId: string, page: number, textHint?: string): Promise<ScoredQuestion[]> {
     const imageHash = sha256(Buffer.concat(images));
-    let questions = this.cache.get(imageHash, this.provider.model, config.VISION_PROMPT_VERSION);
+    const cacheVersion = withHintVersion(config.VISION_PROMPT_VERSION, textHint);
+    let questions = this.cache.get(imageHash, this.provider.model, cacheVersion);
     if (questions) {
       this.budget.recordCacheHit();
       logger.info("VISION", { page, cache: "hit" });
     } else {
-      questions = await this.requestWithSchemaRetry(images, { paperId, page, promptVersion: config.VISION_PROMPT_VERSION });
-      this.cache.put(imageHash, this.provider.model, config.VISION_PROMPT_VERSION, questions);
+      questions = await this.requestWithSchemaRetry(images, {
+        paperId, page, promptVersion: config.VISION_PROMPT_VERSION, ...(textHint ? { textHint } : {}),
+      });
+      this.cache.put(imageHash, this.provider.model, cacheVersion, questions);
       logger.info("VISION", { page, cache: "miss", questions: questions.length });
     }
     return questions.map((question) => this.score(question));
   }
 
-  async verifyLowConfidence(images: Buffer[], paperId: string, page: number, first: ScoredQuestion[]): Promise<ScoredQuestion[]> {
+  async verifyLowConfidence(images: Buffer[], paperId: string, page: number, first: ScoredQuestion[], textHint?: string): Promise<ScoredQuestion[]> {
     if (first.every((item) => item.finalConfidence >= 0.95)) return first;
     const imageHash = sha256(Buffer.concat(images));
     const firstHash = sha256(JSON.stringify(first.map((item) => item.question))).slice(0, 16);
-    const cacheVersion = `${config.VISION_PROMPT_VERSION}:verify:${firstHash}`;
+    const cacheVersion = withHintVersion(`${config.VISION_PROMPT_VERSION}:verify:${firstHash}`, textHint);
     let verified = this.cache.get(imageHash, this.provider.model, cacheVersion);
     if (verified) {
       this.budget.recordCacheHit();
@@ -50,7 +53,7 @@ export class VisionExtractor {
     try {
       verified = await this.requestWithSchemaRetry(images, {
         paperId, page, promptVersion: config.VISION_PROMPT_VERSION, mode: "verify",
-        firstResult: first.map((item) => item.question),
+        firstResult: first.map((item) => item.question), ...(textHint ? { textHint } : {}),
       });
       if (verified.length !== first.length) throw new Error("Verification changed the question count");
     } catch {
@@ -104,7 +107,8 @@ export class VisionExtractor {
     throw lastError;
   }
 
-  private score(question: ExtractedQuestion): ScoredQuestion {
+  /** Apply the same formula/completeness scoring to vision output and to questions parsed from PDF text. */
+  score(question: ExtractedQuestion): ScoredQuestion {
     const combined = [question.stem_markdown, ...question.options.map((option) => option.markdown)].join("\n");
     const formula = this.formulaValidator.validate(combined);
     let confidence = question.confidence - formula.confidencePenalty;
@@ -117,6 +121,10 @@ export class VisionExtractor {
       formulaIssues: formula.issues.map((issue) => issue.code),
     };
   }
+}
+
+function withHintVersion(version: string, textHint: string | undefined): string {
+  return textHint ? `${version}:pdftext:${sha256(textHint).slice(0, 16)}` : version;
 }
 
 export function mergePendingQuestions(questions: ExtractedQuestion[]): ExtractedQuestion[] {

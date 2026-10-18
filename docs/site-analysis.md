@@ -351,7 +351,7 @@ Canvas/PDF page raster
 ## 尚待后续验收、不得猜测的项目
 
 - `/api/myupload/choose_question` 的响应 schema 和业务含义。
-- `filepreview` 响应是直接 PDF 二进制还是包含临时 PDF 地址的响应封装。
+- `filepreview` 响应是直接 PDF 二进制还是包含临时 PDF 地址的响应封装。（实现两种都兼容：只被动读取页面实际收到的 `%PDF-` 内容，含 HTTP 206 分段；见 `docs/implementation.md`。）
 - 几何图题的实际裁剪效果。
 - 明确跨页题的 pending/merge 检测效果。
 - 下载 endpoint、扣额事务和额度接口字段含义（只有用户显式授权下载研究后才能验证）。

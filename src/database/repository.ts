@@ -70,6 +70,7 @@ export class Repository {
     cropPath: string | null,
     finalConfidence: number,
     imageHashes: string[] = [],
+    extractionMethod: string | null = null,
   ): QuestionSaveResult {
     const contentHash = questionContentHash({ stemMarkdown: question.stem_markdown, options: question.options, imageHashes });
     const existing = this.db.prepare("SELECT id FROM questions WHERE content_hash = ?").get(contentHash) as { id: number } | undefined;
@@ -82,9 +83,10 @@ export class Repository {
         questionId = existing.id;
       } else {
         const result = this.db.prepare(`
-          INSERT INTO questions(question_type,stem_markdown,content_hash,vision_confidence,review_status,question_crop_path,created_at,updated_at)
-          VALUES(?,?,?,?,?,?,?,?)
-        `).run(question.type, normalizeQuestionText(question.stem_markdown), contentHash, finalConfidence, reviewStatus, cropPath, timestamp, timestamp);
+          INSERT INTO questions(question_type,stem_markdown,content_hash,vision_confidence,review_status,question_crop_path,extraction_method,created_at,updated_at)
+          VALUES(?,?,?,?,?,?,?,?,?)
+        `).run(question.type, normalizeQuestionText(question.stem_markdown), contentHash, finalConfidence, reviewStatus, cropPath,
+          extractionMethod, timestamp, timestamp);
         questionId = Number(result.lastInsertRowid);
         const insertOption = this.db.prepare(`
           INSERT INTO options(question_id,label,content_markdown) VALUES(?,?,?)
@@ -162,6 +164,19 @@ export class Repository {
         remote_url=excluded.remote_url,local_path=excluded.local_path,sha256=excluded.sha256,
         width=excluded.width,height=excluded.height
     `).run({ ...input, remoteUrl: input.remoteUrl ?? null });
+  }
+
+  savePaperDocument(input: {
+    paperId: number; kind: string; sourceUrl: string | null; localPath: string; sha256: string;
+    byteSize: number; pageCount: number; textLayerPages: number;
+  }): void {
+    this.db.prepare(`
+      INSERT INTO paper_documents(paper_id,kind,source_url_redacted,local_path,sha256,byte_size,page_count,text_layer_pages,captured_at)
+      VALUES(@paperId,@kind,@sourceUrl,@localPath,@sha256,@byteSize,@pageCount,@textLayerPages,@capturedAt)
+      ON CONFLICT(paper_id,kind) DO UPDATE SET source_url_redacted=excluded.source_url_redacted,local_path=excluded.local_path,
+        sha256=excluded.sha256,byte_size=excluded.byte_size,page_count=excluded.page_count,
+        text_layer_pages=excluded.text_layer_pages,captured_at=excluded.captured_at
+    `).run({ ...input, capturedAt: now() });
   }
 
   getPaperByRemoteId(remoteId: string): Record<string, unknown> | undefined {

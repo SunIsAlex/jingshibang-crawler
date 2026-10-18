@@ -3,7 +3,7 @@ import { z } from "zod";
 import { extractedQuestionSchema, visionResultSchema, type ExtractedQuestion } from "../parsing/schemas.js";
 import { redactText } from "../utils/logger.js";
 import type { FigureLocation, VisionExtractOptions, VisionProvider } from "./provider.js";
-import { FORMULA_VERIFY_PROMPT, TRANSCRIPTION_PROMPT, VERIFY_PROMPT } from "./prompts.js";
+import { FORMULA_VERIFY_PROMPT, PDF_TEXT_HINT_PROMPT, TRANSCRIPTION_PROMPT, VERIFY_PROMPT } from "./prompts.js";
 
 interface ChatResponse {
   choices?: Array<{ message?: { content?: string; reasoning_content?: string }; finish_reason?: string }>;
@@ -55,7 +55,8 @@ export class OpenAICompatibleVisionProvider implements VisionProvider {
     assertVisionConfigured();
     if (images.length < 1 || images.length > 3) throw new Error("Each vision request must contain 1 to 3 images");
     const basePrompt = options.mode === "verify" ? VERIFY_PROMPT : options.mode === "formula" ? FORMULA_VERIFY_PROMPT : TRANSCRIPTION_PROMPT;
-    const context = options.mode === "verify" ? `\n首轮结果：${JSON.stringify(options.firstResult ?? [])}` : "";
+    const context = (options.mode === "verify" ? `\n首轮结果：${JSON.stringify(options.firstResult ?? [])}` : "")
+      + (options.textHint && options.mode !== "formula" ? `\n\n${PDF_TEXT_HINT_PROMPT}\nPDF 文字层：\n<<<\n${options.textHint}\n>>>` : "");
     const content: Array<Record<string, unknown>> = [
       { type: "text", text: `${basePrompt}${context}\npaper_id=${options.paperId}; page=${options.page}; prompt_version=${options.promptVersion}` },
       ...images.map((image, index) => ({

@@ -5,7 +5,10 @@ import sharp from "sharp";
 import { config } from "../config.js";
 import { RequestScheduler, StopCrawlError } from "../crawler/scheduler.js";
 import { productDetailResponseSchema, productsResponseSchema, type PaperListItem, type StoreInfo } from "../parsing/schemas.js";
-import { ensureDir, pathExists } from "../utils/files.js";
+import { PdfResponseCapture, type CapturedPdf } from "../pdf/pdf-capture.js";
+import { PdfDocument } from "../pdf/pdf-document.js";
+import type { PdfPageText } from "../pdf/text-layout.js";
+import { atomicWrite, ensureDir, pathExists } from "../utils/files.js";
 import { sha256 } from "../utils/hash.js";
 import { logger } from "../utils/logger.js";
 import { routes } from "./routes.js";
@@ -26,6 +29,24 @@ export interface CapturedPage {
   width: number;
   height: number;
   cached: boolean;
+  /** Embedded PDF text layer in this image's pixel coordinates; absent for canvas screenshots. */
+  text?: PdfPageText;
+}
+
+export interface SavedPdf {
+  localPath: string;
+  sha256: string;
+  byteSize: number;
+  pageCount: number;
+  textLayerPages: number;
+  sourceUrl: string;
+}
+
+export interface OpenedPaper {
+  detail: StoreInfo;
+  pages: CapturedPage[];
+  source: "pdf" | "canvas";
+  pdf: SavedPdf | null;
 }
 
 export class JingshibangClient {
@@ -56,16 +77,75 @@ export class JingshibangClient {
     return parsed.data;
   }
 
-  async openPaper(paperId: string, title: string, explicitlyRequested = false): Promise<{ detail: StoreInfo; pages: CapturedPage[] }> {
+  async openPaper(paperId: string, title: string, explicitlyRequested = false): Promise<OpenedPaper> {
+    const preview = await this.loadPreview(paperId, title, explicitlyRequested, config.PREVIEW_SOURCE !== "canvas");
+    if (preview.pdf) {
+      try {
+        const { saved, pages } = await this.processPdf(paperId, preview.pdf, true);
+        logger.info("PREVIEW", { paper: paperId, source: "pdf", pages: pages.length, textLayerPages: saved.textLayerPages });
+        return { detail: preview.detail, pages, source: "pdf", pdf: saved };
+      } catch (error) {
+        if (config.PREVIEW_SOURCE === "pdf") throw error;
+        logger.warn("PDF", { paper: paperId, usable: false, message: error instanceof Error ? error.message : String(error), fallback: "canvas" });
+      }
+    } else if (config.PREVIEW_SOURCE === "pdf") {
+      throw new Error(`The normal preview of paper ${paperId} did not deliver a raw PDF (PREVIEW_SOURCE=pdf)`);
+    }
+    const pages = await this.captureRenderedPages(paperId);
+    logger.info("PREVIEW", { paper: paperId, source: "canvas", pages: pages.length });
+    return { detail: preview.detail, pages, source: "canvas", pdf: null };
+  }
+
+  /** Save the original PDF delivered to the normal preview, without rendering pages or calling any AI. */
+  async fetchPdf(paperId: string, title: string, explicitlyRequested = false): Promise<{ detail: StoreInfo; pdf: SavedPdf }> {
+    const preview = await this.loadPreview(paperId, title, explicitlyRequested, true);
+    if (!preview.pdf) throw new Error(`The normal preview of paper ${paperId} did not deliver a raw PDF`);
+    const { saved } = await this.processPdf(paperId, preview.pdf, false);
+    return { detail: preview.detail, pdf: saved };
+  }
+
+  private async loadPreview(paperId: string, title: string, explicitlyRequested: boolean, capturePdf: boolean): Promise<{ detail: StoreInfo; pdf: CapturedPdf | null }> {
     this.guard.assertKnownPaperId(paperId, explicitlyRequested);
     const url = routes.paperDetail(paperId, title); this.guard.assertAllowedRequest(url, "page");
-    const response = await this.performAndWait(`/api/product/detail/${paperId}`, () => this.page.goto(url, { waitUntil: "domcontentloaded" }));
-    const detail = productDetailResponseSchema.parse(await response.json()).data.storeInfo;
-    await this.page.locator(".pdf-page canvas").first().waitFor({ state: "visible", timeout: config.BROWSER_TIMEOUT_MS });
-    await this.page.waitForTimeout(1_000);
-    const pages = await this.captureRenderedPages(paperId);
-    logger.info("PREVIEW", { paper: paperId, pages: pages.length });
-    return { detail, pages };
+    // Passive listener only: it reads the PDF the preview page fetches for PDF.js and never sends a request.
+    const capture = new PdfResponseCapture();
+    if (capturePdf) capture.attach(this.page);
+    try {
+      const response = await this.performAndWait(`/api/product/detail/${paperId}`, () => this.page.goto(url, { waitUntil: "domcontentloaded" }));
+      const detail = productDetailResponseSchema.parse(await response.json()).data.storeInfo;
+      await this.page.locator(".pdf-page canvas").first().waitFor({ state: "visible", timeout: config.BROWSER_TIMEOUT_MS });
+      await this.page.waitForTimeout(1_000);
+      const pdf = capturePdf ? await capture.waitForPdf(config.PDF_CAPTURE_TIMEOUT_MS) : null;
+      return { detail, pdf };
+    } finally { capture.detach(); }
+  }
+
+  private async processPdf(paperId: string, pdf: CapturedPdf, render: boolean): Promise<{ saved: SavedPdf; pages: CapturedPage[] }> {
+    const document = await PdfDocument.open(pdf.buffer);
+    try {
+      const localPath = path.join(config.pdfDir, `${paperId}.pdf`);
+      const unchanged = await pathExists(localPath) && sha256(await fs.readFile(localPath)) === pdf.sha256;
+      if (!unchanged) await atomicWrite(localPath, pdf.buffer);
+      const scale = config.PDF_RENDER_SCALE;
+      const directory = path.join(config.rawPagesDir, paperId); if (render) await ensureDir(directory);
+      const pages: CapturedPage[] = [];
+      let textLayerPages = 0;
+      for (let pageNo = 1; pageNo <= document.pageCount; pageNo += 1) {
+        const text = await document.extractText(pageNo, scale);
+        if (text.reliable) textLayerPages += 1;
+        if (!render) continue;
+        const { png, width, height } = await document.renderPage(pageNo, scale);
+        const localPagePath = path.join(directory, `page-${String(pageNo).padStart(3, "0")}.png`);
+        const pageHash = sha256(png);
+        const cacheHit = await pathExists(localPagePath) && sha256(await fs.readFile(localPagePath)) === pageHash;
+        if (!cacheHit) await fs.writeFile(localPagePath, png);
+        pages.push({ pageNo, localPath: localPagePath, sha256: pageHash, width, height, cached: cacheHit, text });
+        logger.info("PAGE", { page: pageNo, source: "pdf", cached: cacheHit, textLayer: text.reliable });
+      }
+      const saved = { localPath, sha256: pdf.sha256, byteSize: pdf.buffer.length, pageCount: document.pageCount, textLayerPages, sourceUrl: pdf.sourceUrl };
+      logger.info("PDF", { paper: paperId, saved: true, cached: unchanged, pages: saved.pageCount, textLayerPages, bytes: saved.byteSize });
+      return { saved, pages };
+    } finally { await document.close(); }
   }
 
   private async captureRenderedPages(paperId: string): Promise<CapturedPage[]> {
